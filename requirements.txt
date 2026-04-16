@@ -1,0 +1,11 @@
+fastapi==0.111.0
+python-dotenv
+passlib
+pathlib
+pydantic
+pydantic_core
+PyJWT
+pymongo
+requests
+uvicorn
+
