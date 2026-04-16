@@ -1,50 +1,44 @@
-from fastapi import APIRouter,HTTPException,Body,Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi import HTTPException
-import os
-from dotenv import load_dotenv
-from fastapi import  HTTPException
-from pydantic import BaseModel, EmailStr,validator
-from pymongo import MongoClient
-from passlib.context import CryptContext
-from datetime import datetime, timedelta
-import os
+from fastapi import APIRouter, HTTPException
 from fastapi.responses import JSONResponse
-from datetime import timedelta
-from fastapi import  HTTPException
+from pydantic import BaseModel, EmailStr
+from pymongo import MongoClient
+from datetime import datetime, timedelta
 from typing import Optional
 from bson import ObjectId
+import os
+import logging
 
-
+from dotenv import load_dotenv
 load_dotenv()
 
-
-"""" custom module import """
-from functions import generate_recovery_code,generate_token,send_recovery_email,send_verify_email_code
+from functions import (
+    generate_recovery_code,
+    generate_token,
+    send_recovery_email,
+    send_verify_email_code,
+    hash_password,
+    verify_password,
+    VERIFY_CODE_MINUTES,
+    TOKEN_LIFETIME_DAYS,
+)
 from jwt_dacorator import token_required
 
+# ─── Logger ───────────────────────────────────────────────────────────────────
+logger = logging.getLogger("user_auth.routers")
 
-
-
-
-
+# ─── DB Setup ─────────────────────────────────────────────────────────────────
+MONGO_URI = os.getenv("MONGO_URI")
+client = MongoClient(MONGO_URI)
+db = client["db_name"]
+user_collection          = db["user_collection_name"]
+verify_email_col         = db["verify_user_email"]          # signup verification
+verify_email_update_col  = db["verify_user_email_update"]   # email change verification
+recovery_col             = db["recovery_collection"]        # forgot password
 
 user_auth = APIRouter()
 
 
-
-
-## set mongo client
-MONGO_URI = os.getenv("MONGO_URI")
-client = MongoClient(MONGO_URI)
-db = client['db_name']
-user_collection = db['user_collection_name']
-recovery_collection = db['recovery_code_collection_name']
-
-
-
-
-""" data validation using pydantic """
+# ─── Pydantic Models ──────────────────────────────────────────────────────────
 
 class User(BaseModel):
     username: str
@@ -52,24 +46,18 @@ class User(BaseModel):
     password: str
     confirm_password: str
 
-
 class Login(BaseModel):
     email: EmailStr
     password: str
 
-
-class Token(BaseModel):
-    token: str
-    token_timestamp: datetime
-
 class Mail_verify(BaseModel):
     email: EmailStr
-    code : str
+    code: str
 
 class Mail_verify_to_update(BaseModel):
     email: EmailStr
-    code : str
-    userid : str
+    code: str
+    userid: str
 
 class ForgotPassword(BaseModel):
     email: EmailStr
@@ -83,272 +71,412 @@ class ResetPassword(BaseModel):
     new_password: str
     confirm_password: str
 
-class GetProfile(BaseModel):
-    userid: str
-
+class ResendVerifyCode(BaseModel):
+    email: EmailStr
 
 class UpdateProfile(BaseModel):
-    userid : str
+    userid: str
     name: Optional[str] = None
     email: Optional[EmailStr] = None
     current_password: Optional[str] = None
     new_password: Optional[str] = None
     confirm_password: Optional[str] = None
-    profile_picture: Optional[str] = None  # Base64 encoded picture
+    profile_picture: Optional[str] = None
 
 
-"""  routers  """
-
-
-
+# ─── /signup ──────────────────────────────────────────────────────────────────
 
 @user_auth.post("/signup")
 async def signup(user: User):
-        if user_collection.find_one({"email": user.email}):
-            raise HTTPException(status_code=409, detail="Email already in use. Please use a different email address.")
+    logger.info(f"Signup attempt: email={user.email}")
 
-        hashed_password = CryptContext(schemes=["pbkdf2_sha256"]).hash(user.password)
-        user_dict = user.dict()
-        user_dict["password_hashed"] = hashed_password
-        del user_dict["confirm_password"]    #original password ka kiya seen ha
-        code= generate_recovery_code()
-        response=send_verify_email_code(user.email, code)
-        print(" repnse after mail  : ",response)
-        if response=="success":
-            user_collection.insert_one(user_dict)
-            check_user_existance=user_collection.find_one({'email': user.email})
-            db.verify_user_email.insert_one({"email":user.email,"code":code})
-            return {"Response": "User created successfully","id":str(check_user_existance["_id"]),"username":str(check_user_existance['username'])}
-        else:
-            return {"Response": "mail server error occur"}
+    # Password match check
+    if user.password != user.confirm_password:
+        logger.warning(f"Signup failed — password mismatch: email={user.email}")
+        raise HTTPException(status_code=400, detail="Passwords do not match.")
+
+    # Duplicate email check
+    if user_collection.find_one({"email": user.email}):
+        logger.warning(f"Signup failed — email already exists: email={user.email}")
+        raise HTTPException(status_code=409, detail="Email already in use.")
+
+    # Send verification email PEHLE — agar mail fail ho to user save mat karo
+    code = generate_recovery_code()
+    mail_sent = send_verify_email_code(user.email, code)
+    if not mail_sent:
+        logger.error(f"Signup email send failed: email={user.email}")
+        raise HTTPException(status_code=500, detail="Mail server error. Please try again.")
+
+    # BUG FIX: plain password save nahi karo — sirf hashed
+    hashed = hash_password(user.password)
+    user_dict = {
+        "username": user.username,
+        "email": user.email,
+        "password_hashed": hashed,          # sirf yahi chahiye
+        "is_verified": False,
+        "created_at": datetime.utcnow(),
+    }
+    inserted = user_collection.insert_one(user_dict)
+    user_id = str(inserted.inserted_id)
+
+    # Verification code save karo — expiry ke sath
+    verify_email_col.delete_many({"email": user.email})  # purana clear karo
+    verify_email_col.insert_one({
+        "email": user.email,
+        "code": code,
+        "expires_at": datetime.utcnow() + timedelta(minutes=VERIFY_CODE_MINUTES),
+    })
+
+    logger.info(f"Signup successful — awaiting verification: email={user.email}, id={user_id}")
+    return {
+        "message": "User created. Please verify your email within 10 minutes.",
+        "id": user_id,
+        "username": user.username,
+        "verify_expires_in_minutes": VERIFY_CODE_MINUTES,
+    }
 
 
+# ─── /resend_verify_code ──────────────────────────────────────────────────────
+
+@user_auth.post("/resend_verify_code")
+async def resend_verify_code(data: ResendVerifyCode):
+    """
+    BUG FIX: Galat code daalne pe user delete ho jata tha.
+    Ab user resend kar sakta hai — DB mein code update ho jata hai.
+    """
+    logger.info(f"Resend verify code request: email={data.email}")
+
+    user = user_collection.find_one({"email": data.email})
+    if not user:
+        raise HTTPException(status_code=404, detail="No account found with this email.")
+
+    if user.get("is_verified"):
+        raise HTTPException(status_code=400, detail="Email is already verified.")
+
+    code = generate_recovery_code()
+    mail_sent = send_verify_email_code(data.email, code)
+    if not mail_sent:
+        raise HTTPException(status_code=500, detail="Could not send email. Try again.")
+
+    # Naya code update karo
+    verify_email_col.update_one(
+        {"email": data.email},
+        {"$set": {
+            "code": code,
+            "expires_at": datetime.utcnow() + timedelta(minutes=VERIFY_CODE_MINUTES),
+        }},
+        upsert=True,
+    )
+    logger.info(f"Verification code resent: email={data.email}")
+    return {
+        "message": "New verification code sent.",
+        "verify_expires_in_minutes": VERIFY_CODE_MINUTES,
+    }
 
 
-
+# ─── /verify_user_email ───────────────────────────────────────────────────────
 
 @user_auth.post("/verify_user_email")
-async def verify_recovery_code(verify:Mail_verify):
-    recovery_data = db.verify_user_email.find_one({
-        "email":verify.email,
-        "code":verify.code
-    })
-    print("recovery data   :  ",recovery_data)
+async def verify_user_email(verify: Mail_verify):
+    logger.info(f"Email verify attempt: email={verify.email}")
+
+    recovery_data = verify_email_col.find_one({"email": verify.email})
+
     if not recovery_data:
-        raise HTTPException(status_code=400, detail="Invalid or expired recovery code")
+        logger.warning(f"Verify failed — no record found: email={verify.email}")
+        raise HTTPException(status_code=400, detail="No verification pending for this email. Please signup again.")
 
-    if recovery_data:
-        for labels in recovery_data:
-                      if labels=="email" :
-                          email=recovery_data[labels]
-                      elif labels=="code":
-                          code=recovery_data[labels]
+    # BUG FIX: expiry check
+    if datetime.utcnow() > recovery_data.get("expires_at", datetime.utcnow()):
+        logger.warning(f"Verify failed — code expired: email={verify.email}")
+        # User delete mat karo — sirf code delete karo
+        verify_email_col.delete_one({"email": verify.email})
+        raise HTTPException(
+            status_code=400,
+            detail=f"Verification code expired. Please request a new one using /resend_verify_code."
+        )
 
-        else:
-            check_user_existance=user_collection.find_one({'email': verify.email})
-            if email==verify.email and code==verify.code:
-                filter_query = {"email": verify.email}
-                result = db.verify_user_email.delete_one(filter_query)
-                return {"message": "User created successfully","id":str(check_user_existance["_id"])}
-            else:
-                filter_query = {"email": verify.email}
-                result = user_collection.delete_one(filter_query)
-                if result.deleted_count > 0:
-                    return {"message": "User not created successfully (may be code not match)"}
-                else:
+    # BUG FIX: galat code pe user delete hona BAND — sirf error return karo
+    if recovery_data["code"] != verify.code:
+        logger.warning(f"Verify failed — wrong code: email={verify.email}")
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid code. Please try again or use /resend_verify_code."
+        )
 
-                    return {"message": "User not created successfully (may be code not match) "}
+    # Sab theek — user ko verified mark karo
+    user_collection.update_one(
+        {"email": verify.email},
+        {"$set": {"is_verified": True}}
+    )
+    verify_email_col.delete_one({"email": verify.email})
+
+    user = user_collection.find_one({"email": verify.email})
+    logger.info(f"Email verified successfully: email={verify.email}")
+    return {
+        "message": "Email verified successfully.",
+        "id": str(user["_id"]),
+    }
 
 
-
+# ─── /login ───────────────────────────────────────────────────────────────────
 
 @user_auth.post("/login")
 async def login(login_data: Login):
+    logger.info(f"Login attempt: email={login_data.email}")
+
     user = user_collection.find_one({"email": login_data.email})
 
-    if not user or not CryptContext(schemes=["pbkdf2_sha256"]).verify(login_data.password, user["password_hashed"]):
-        print("user not found  : ")
-        raise HTTPException(status_code=401, detail="Invalid credentials")
+    if not user or not verify_password(login_data.password, user.get("password_hashed", "")):
+        logger.warning(f"Login failed — invalid credentials: email={login_data.email}")
+        raise HTTPException(status_code=401, detail="Invalid credentials.")
 
-    # Fetch the username from the user object
-    username = user.get("username", "")
-    print("username   : ",username)
+    # BUG FIX: Unverified user login nahi kar sakta
+    if not user.get("is_verified", False):
+        logger.warning(f"Login blocked — email not verified: email={login_data.email}")
+        raise HTTPException(
+            status_code=403,
+            detail="Please verify your email first. Use /resend_verify_code if code expired."
+        )
 
     token = generate_token(login_data.email)
-    print("token   : ",token )
-    token_timestamp = datetime.utcnow() + timedelta(days=30)
-    user_collection.update_one({"_id": user["_id"]}, {"$set": {"token": token, "token_timestamp": token_timestamp}})
+    token_expiry = datetime.utcnow() + timedelta(days=TOKEN_LIFETIME_DAYS)
 
-    # Return the username along with the token and token timestamp
-    return {"userid" : str(user["_id"]), "username": username, "token": token, "token_timestamp": token_timestamp}
+    user_collection.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"token": token, "token_timestamp": token_expiry}}
+    )
 
+    logger.info(f"Login successful: email={login_data.email}, id={str(user['_id'])}")
+    return {
+        "userid": str(user["_id"]),
+        "username": user.get("username", ""),
+        "token": token,
+        "token_expires_at": token_expiry.isoformat(),
+        "token_lifetime_days": TOKEN_LIFETIME_DAYS,
+    }
+
+
+# ─── /forgot_password ─────────────────────────────────────────────────────────
 
 @user_auth.post("/forgot_password")
-async def forgot_password( forgot_password_data: ForgotPassword):
-    user = user_collection.find_one({"email": forgot_password_data.email})
+async def forgot_password(data: ForgotPassword):
+    logger.info(f"Forgot password request: email={data.email}")
+
+    user = user_collection.find_one({"email": data.email})
     if not user:
-        raise HTTPException(status_code=404, detail="Email not found")
+        raise HTTPException(status_code=404, detail="Email not found.")
 
     code = generate_recovery_code()
-    recovery_data = {
-        "user_id": user["_id"],
-        "recovery_code": code,
-        "timestamp": datetime.utcnow()
-    }
-    db.recovery_collection.insert_one(recovery_data)
+    mail_sent = send_recovery_email(data.email, code)
+    if not mail_sent:
+        logger.error(f"Recovery email failed: email={data.email}")
+        raise HTTPException(status_code=500, detail="Could not send recovery email. Try again.")
 
-    send_recovery_email(forgot_password_data.email, code)
-    return {"message": "Recovery code sent to your email"}
+    recovery_col.delete_many({"user_id": user["_id"]})   # purana code hatao
+    recovery_col.insert_one({
+        "user_id": user["_id"],
+        "email": data.email,
+        "recovery_code": code,
+        "expires_at": datetime.utcnow() + timedelta(minutes=VERIFY_CODE_MINUTES),
+    })
+
+    logger.info(f"Recovery code sent: email={data.email}")
+    return {
+        "message": "Recovery code sent to your email.",
+        "expires_in_minutes": VERIFY_CODE_MINUTES,
+    }
+
+
+# ─── /verify_recovery_code ────────────────────────────────────────────────────
 
 @user_auth.post("/verify_recovery_code")
 async def verify_recovery_code(recovery: Recovery):
-    recovery_data = db.recovery_collection.find_one({
-        "recovery_code": recovery.code,
-        "timestamp": {"$gte": datetime.utcnow() - timedelta(minutes=10)}
-    })
+    logger.info(f"Recovery code verify attempt: code={recovery.code}")
+
+    recovery_data = recovery_col.find_one({"recovery_code": recovery.code})
     if not recovery_data:
-        raise HTTPException(status_code=400, detail="Invalid or expired recovery code")
-    return {"message": "Recovery code verified successfully"}
+        raise HTTPException(status_code=400, detail="Invalid recovery code.")
+
+    if datetime.utcnow() > recovery_data.get("expires_at", datetime.utcnow()):
+        recovery_col.delete_one({"_id": recovery_data["_id"]})
+        raise HTTPException(status_code=400, detail="Recovery code expired. Please request a new one.")
+
+    logger.info(f"Recovery code verified successfully")
+    return {"message": "Recovery code verified."}
+
+
+# ─── /reset_password ──────────────────────────────────────────────────────────
 
 @user_auth.post("/reset_password")
-async def reset_password(reset_password_data: ResetPassword):
-    user = user_collection.find_one({"email": reset_password_data.email})
+async def reset_password(data: ResetPassword):
+    logger.info(f"Reset password request: email={data.email}")
+
+    user = user_collection.find_one({"email": data.email})
     if not user:
-        raise HTTPException(status_code=404, detail="Email not found")
+        raise HTTPException(status_code=404, detail="Email not found.")
 
-    recovery_data = db.recovery_collection.find_one({"recovery_code": reset_password_data.code})
+    recovery_data = recovery_col.find_one({"recovery_code": data.code})
     if not recovery_data:
-        raise HTTPException(status_code=400, detail="Invalid or expired recovery code")
+        raise HTTPException(status_code=400, detail="Invalid recovery code.")
 
-    expiration_time = recovery_data["timestamp"] + timedelta(minutes=10)
-    if datetime.utcnow() > expiration_time:
-        raise HTTPException(status_code=400, detail="Invalid or expired recovery code")
+    if datetime.utcnow() > recovery_data.get("expires_at", datetime.utcnow()):
+        recovery_col.delete_one({"_id": recovery_data["_id"]})
+        raise HTTPException(status_code=400, detail="Recovery code expired.")
 
-    if reset_password_data.new_password != reset_password_data.confirm_password:
-        raise HTTPException(status_code=400, detail="New password and confirm password do not match")
+    if data.new_password != data.confirm_password:
+        raise HTTPException(status_code=400, detail="Passwords do not match.")
 
-    hashed_password = CryptContext(schemes=["pbkdf2_sha256"]).hash(reset_password_data.new_password)
-    user_collection.update_one({"_id": user["_id"]}, {"$set": {"password_hashed": hashed_password, "plain_password": reset_password_data.new_password}})
-    db.recovery_collection.delete_one({"_id": recovery_data["_id"]})
+    # BUG FIX: sirf hashed password save karo — plain password bilkul nahi
+    hashed = hash_password(data.new_password)
+    user_collection.update_one(
+        {"_id": user["_id"]},
+        {"$set": {"password_hashed": hashed},
+         "$unset": {"password": "", "plain_password": ""}}   # purane plain fields hatao
+    )
+    recovery_col.delete_one({"_id": recovery_data["_id"]})
 
-    return {"message": "Password successfully reset. You can now log in with your new password."}
-
-
-
-@user_auth.post("/verify_user_email_to_update")
-async def verify_email_code_to_update(verify:Mail_verify_to_update):
-    data = verify.dict()
-    print("dat   :  ",data)
-    recovery_data = db.verify_user_email_update.find_one({
-        "new_email":verify.email,
-        "code":verify.code
-    })
-    print("recovery data   :  ",recovery_data)
-    if not recovery_data:
-        raise HTTPException(status_code=400, detail="Invalid recovery code")
-    update_email= ""
-    code = ""
-    if recovery_data:
-        for labels in recovery_data:
-            if labels=="new_email" :
-                update_email=recovery_data[labels]
-            elif labels=="code":
-                code =recovery_data[labels]
-    if verify.email == update_email and verify.code==code:
-        user_collection.update_one({"_id": ObjectId(verify.userid)}, {"$set": {"email": verify.email}})
-        return JSONResponse(content="updated",status_code=200)
-    else:
-        return JSONResponse(content="Some error",status_code=400)
+    logger.info(f"Password reset successful: email={data.email}")
+    return {"message": "Password reset successfully. You can now login."}
 
 
+# ─── /update_profile ──────────────────────────────────────────────────────────
 
 @user_auth.post("/update_profile")
 async def update_profile(profile_data: UpdateProfile):
     user_id = profile_data.userid
-    new_profile_picture=new_name=new_email=new_password=confirm_password=current_password=None
-    if not user_id:
-        raise HTTPException(status_code=404, detail="UserId Required")
-    if profile_data.profile_picture is not None:
-        new_profile_picture = profile_data.profile_picture
-    if profile_data.name is not None:
-        new_name = profile_data.name
-    if profile_data.email is not None:
-        new_email = profile_data.email
-    if (profile_data.current_password is not None and
-        profile_data.new_password is not None and
-        profile_data.confirm_password is not None):
+    logger.info(f"Update profile request: userid={user_id}")
 
-        current_password = profile_data.current_password
-        new_password = profile_data.new_password
-        confirm_password = profile_data.confirm_password
-    user = user_collection.find_one({"_id": ObjectId(user_id)})
+    if not user_id:
+        raise HTTPException(status_code=400, detail="UserId required.")
+
+    try:
+        user = user_collection.find_one({"_id": ObjectId(user_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user ID format.")
+
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+
     new_data = {}
-    if user:
-        if new_profile_picture:
-            new_data['profile_pic'] = new_profile_picture
-        if new_name:
-            new_data['username'] = new_name
-        if new_email :
-            # new_data['email'] = new_email
-            code= generate_recovery_code()
-            response=send_verify_email_code(new_email, code)
-            if response=="success":
-                db.verify_user_email_update.insert_one({"userid" :profile_data.userid , "new_email": new_email, "code": code})
-                return JSONResponse(content="Email sent",status_code=200)
-            else:
-                return JSONResponse(content="Email not sent",status_code=500)
-        if current_password :
-            if current_password == user['password']:
-                if new_password==confirm_password:
-                    new_data['password'] = new_password
-                    hashed_password = CryptContext(schemes=["pbkdf2_sha256"]).hash(new_password)
-                    new_data['password_hashed'] = hashed_password
-                else:
-                    return JSONResponse(content = "new password and confirmed password not matched",status_code=400)
-            else:
-                return JSONResponse(content = "Current password not correct",status_code=400)
+
+    # Profile picture
+    if profile_data.profile_picture is not None:
+        new_data["profile_pic"] = profile_data.profile_picture
+        logger.info(f"Profile picture update: userid={user_id}")
+
+    # Name
+    if profile_data.name is not None:
+        new_data["username"] = profile_data.name
+        logger.info(f"Name update: userid={user_id}, name={profile_data.name}")
+
+    # Email change — verification flow
+    if profile_data.email is not None:
+        code = generate_recovery_code()
+        mail_sent = send_verify_email_code(profile_data.email, code)
+        if not mail_sent:
+            raise HTTPException(status_code=500, detail="Could not send verification email.")
+
+        verify_email_update_col.delete_many({"userid": user_id})
+        verify_email_update_col.insert_one({
+            "userid": user_id,
+            "new_email": profile_data.email,
+            "code": code,
+            "expires_at": datetime.utcnow() + timedelta(minutes=VERIFY_CODE_MINUTES),
+        })
+        logger.info(f"Email change code sent: userid={user_id}, new_email={profile_data.email}")
+
+        # BUG FIX: email update early return se pehle name/pic updates bhi apply karo
         if new_data:
             user_collection.update_one({"_id": ObjectId(user_id)}, {"$set": new_data})
-            return JSONResponse(content = "updated ", status_code=200)
-        else:
-            return JSONResponse(content = "Empty payload ", status_code=200)
+            logger.info(f"Other profile fields updated alongside email request: userid={user_id}")
+
+        return JSONResponse(
+            content={
+                "message": "Verification email sent to new address.",
+                "verify_expires_in_minutes": VERIFY_CODE_MINUTES,
+            },
+            status_code=200,
+        )
+
+    # Password change
+    if profile_data.current_password:
+        if not verify_password(profile_data.current_password, user.get("password_hashed", "")):
+            logger.warning(f"Password update failed — wrong current password: userid={user_id}")
+            return JSONResponse(content={"message": "Current password is incorrect."}, status_code=400)
+
+        if profile_data.new_password != profile_data.confirm_password:
+            return JSONResponse(content={"message": "New passwords do not match."}, status_code=400)
+
+        # BUG FIX: sirf hashed save karo
+        new_data["password_hashed"] = hash_password(profile_data.new_password)
+        logger.info(f"Password updated: userid={user_id}")
+
+    # BUG FIX: update apply karo — pehle sirf return ho jata tha bina update ke
+    if new_data:
+        result = user_collection.update_one({"_id": ObjectId(user_id)}, {"$set": new_data})
+        if result.modified_count == 0:
+            logger.warning(f"Update ran but nothing changed: userid={user_id}")
+            return JSONResponse(content={"message": "No changes applied (data may be same)."}, status_code=200)
+        logger.info(f"Profile updated successfully: userid={user_id}, fields={list(new_data.keys())}")
+        return JSONResponse(content={"message": "Profile updated successfully."}, status_code=200)
     else:
-        raise HTTPException(status_code=404, detail="User not found")
+        return JSONResponse(content={"message": "Nothing to update."}, status_code=200)
+
+
+# ─── /verify_user_email_to_update ─────────────────────────────────────────────
+
+@user_auth.post("/verify_user_email_to_update")
+async def verify_email_to_update(verify: Mail_verify_to_update):
+    logger.info(f"Email update verify: userid={verify.userid}, new_email={verify.email}")
+
+    recovery_data = verify_email_update_col.find_one({
+        "new_email": verify.email,
+        "userid": verify.userid,
+    })
+
+    if not recovery_data:
+        raise HTTPException(status_code=400, detail="Invalid or expired verification code.")
+
+    if datetime.utcnow() > recovery_data.get("expires_at", datetime.utcnow()):
+        verify_email_update_col.delete_one({"_id": recovery_data["_id"]})
+        raise HTTPException(status_code=400, detail="Code expired. Request email change again.")
+
+    if recovery_data["code"] != verify.code:
+        raise HTTPException(status_code=400, detail="Invalid code.")
+
+    user_collection.update_one(
+        {"_id": ObjectId(verify.userid)},
+        {"$set": {"email": verify.email}}
+    )
+    verify_email_update_col.delete_one({"_id": recovery_data["_id"]})
+
+    logger.info(f"Email updated successfully: userid={verify.userid}, new_email={verify.email}")
+    return JSONResponse(content={"message": "Email updated successfully."}, status_code=200)
+
+
+# ─── /get_profile ─────────────────────────────────────────────────────────────
 
 @user_auth.get("/get_profile")
-async def get_profile(user_id : str ):
-    # user_id = get_profile_data.userid
+async def get_profile(user_id: str):
+    logger.info(f"Get profile request: userid={user_id}")
+
     if not user_id:
-        raise HTTPException(status_code=404, detail="UserId Required")
+        raise HTTPException(status_code=400, detail="UserId required.")
 
-    user = user_collection.find_one({"_id": ObjectId(user_id)})
-    if user:
-        pic = user.get("profile_pic",None)
-        name = user.get("username",None)
-        if name :
-            content = {"username":name,"picture":pic}
-            return JSONResponse(content = content, status_code=200)
-        else:
-            return JSONResponse(content = "No profile image ", status_code=401)
-    else:
-        raise HTTPException(status_code=404, detail="User not found")
+    try:
+        user = user_collection.find_one({"_id": ObjectId(user_id)})
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid user ID.")
 
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
 
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
+    content = {
+        "username": user.get("username"),
+        "email": user.get("email"),
+        "picture": user.get("profile_pic"),
+        "is_verified": user.get("is_verified", False),
+    }
+    logger.info(f"Profile fetched: userid={user_id}")
+    return JSONResponse(content=content, status_code=200)
